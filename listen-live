@@ -1,0 +1,257 @@
+#!/bin/bash
+
+# Get audio input devices
+echo "🎤 Available audio input devices:"
+echo ""
+DEVICES=$(system_profiler SPAudioDataType 2>/dev/null | awk '
+  /^        [A-Za-z]/ && !/:        / {
+    device = $0; sub(/^[[:space:]]*/, "", device); sub(/:$/, "", device)
+  }
+  /Input Channels:/ && device != "" { print device; device = "" }
+')
+
+if [ -z "$DEVICES" ]; then
+  echo "❌ No input devices found"
+  exit 1
+fi
+
+echo "$DEVICES" | nl -w1 -s") "
+echo ""
+echo "0) System default"
+echo ""
+read -p "Select device: " DEVICE_NUM
+
+if [ -z "$DEVICE_NUM" ] || [ "$DEVICE_NUM" = "0" ]; then
+  CAPTURE_ID=-1
+else
+  CAPTURE_ID=$((DEVICE_NUM - 1))
+fi
+
+# Select mode
+echo ""
+echo "Select mode:"
+echo "1) Continuous - Always listening, auto-copy"
+echo "2) Push-to-talk - Hold Cmd+\\ to record"
+echo ""
+read -p "Mode: " MODE
+
+PTT_START="/tmp/listen_ptt_start"
+PTT_STOP="/tmp/listen_ptt_stop"
+rm -f "$PTT_START" "$PTT_STOP"
+
+cleanup() {
+  rm -f "$PTT_START" "$PTT_STOP"
+  pkill -f whisper-stream 2>/dev/null
+  exit 0
+}
+trap cleanup INT TERM EXIT
+
+clear
+
+if [ "$MODE" = "2" ]; then
+  # ===== PUSH-TO-TALK MODE =====
+  echo "🎤 Push-to-Talk Mode"
+  echo ""
+  echo "Ready! Hold Cmd+\\ to record..."
+  
+  while true; do
+    if [ -f "$PTT_START" ]; then
+      rm -f "$PTT_START"
+      echo ""
+      echo "🔴 Recording..."
+      
+      OUTFILE=$(mktemp)
+      
+      # Start whisper
+      /opt/homebrew/bin/whisper-stream \
+        -m ~/.whisper-models/ggml-small.bin \
+        -t 8 \
+        --step 500 \
+        --length 600000 \
+        -c $CAPTURE_ID > "$OUTFILE" 2>&1 &
+      
+      WHISPER_PID=$!
+      
+      # Monitor and display live transcription
+      LAST_DISPLAY=""
+      while [ ! -f "$PTT_STOP" ]; do
+        # Extract latest text
+        LIVE_TEXT=$(cat "$OUTFILE" 2>/dev/null | \
+          sed 's/\x1b\[[0-9;]*[mKGH]//g' | \
+          sed 's/\r/\n/g' | \
+          sed -n '/\[Start speaking\]/,$p' | \
+          grep -v "whisper\|ggml\|init:\|main:\|Start speaking" | \
+          grep -viE '^\[.*\]$|^\(.*\)$|^[[:space:]]*$' | \
+          sed 's/^ *//; s/ *$//' | \
+          awk '{if(length > max){max=length; line=$0}} END{print line}')
+        
+        # Update display if text changed
+        if [ -n "$LIVE_TEXT" ] && [ "$LIVE_TEXT" != "$LAST_DISPLAY" ]; then
+          clear
+          echo "🔴 Recording..."
+          echo ""
+          echo "💬 $LIVE_TEXT"
+          LAST_DISPLAY="$LIVE_TEXT"
+        fi
+        
+        sleep 0.1
+      done
+      rm -f "$PTT_STOP"
+      
+      # Kill whisper
+      kill -9 $WHISPER_PID 2>/dev/null
+      wait $WHISPER_PID 2>/dev/null
+      
+      # Extract final text - get everything after [Start speaking], strip ANSI codes
+      # Then find the longest single line (whisper overwrites with progressively longer text)
+      TEXT=$(cat "$OUTFILE" | \
+        sed 's/\x1b\[[0-9;]*[mKGH]//g' | \
+        sed 's/\r/\n/g' | \
+        sed -n '/\[Start speaking\]/,$p' | \
+        grep -v "whisper\|ggml\|init:\|main:\|Start speaking" | \
+        grep -viE '^\[.*\]$|^\(.*\)$|^[[:space:]]*$' | \
+        sed 's/^ *//; s/ *$//' | \
+        awk '{if(length > max){max=length; line=$0}} END{print line}')
+      
+      rm -f "$OUTFILE"
+      
+      if [ -n "$TEXT" ]; then
+        printf "%s" "$TEXT" | pbcopy
+        # Replace 💬 with ✅ on the same line
+        clear
+        echo "🔴 Recording..."
+        echo ""
+        echo "✅ Copied: $TEXT"
+      else
+        echo ""
+        echo "⚠️  No speech detected"
+      fi
+      echo ""
+      echo "Ready!"
+    fi
+    sleep 0.1
+  done
+
+else
+  # ===== CONTINUOUS MODE =====
+  echo "🎤 Continuous Mode"
+  echo ""
+  echo "Listening... (auto-copy)"
+  echo ""
+  echo ""
+
+  ACCUMULATED=""
+  CURRENT_TEXT=""
+  LAST_TIME=$(date +%s)
+  OUTFILE=$(mktemp)
+  LAST_SEGMENT_COUNT=0
+
+  # Start whisper in background
+  /opt/homebrew/bin/whisper-stream \
+    -m ~/.whisper-models/ggml-small.bin \
+    -t 8 \
+    --step 500 \
+    --length 600000 \
+    -c $CAPTURE_ID > "$OUTFILE" 2>&1 &
+  
+  WHISPER_PID=$!
+  
+  # Monitor output file
+  while kill -0 $WHISPER_PID 2>/dev/null; do
+    NOW=$(date +%s)
+    
+    # Timeout - finalize and reset after 5s of silence
+    if [ $((NOW - LAST_TIME)) -gt 5 ]; then
+      if [ -n "$ACCUMULATED" ] || [ -n "$CURRENT_TEXT" ]; then
+        # Finalize current text
+        if [ -n "$CURRENT_TEXT" ]; then
+          if [ -n "$ACCUMULATED" ]; then
+            ACCUMULATED="$ACCUMULATED $CURRENT_TEXT"
+          else
+            ACCUMULATED="$CURRENT_TEXT"
+          fi
+        fi
+        
+        # Copy final text
+        if [ -n "$ACCUMULATED" ]; then
+          printf "%s" "$ACCUMULATED" | pbcopy
+          clear
+          echo "🎤 Continuous Mode"
+          echo ""
+          echo "✅ Copied: $ACCUMULATED"
+          echo ""
+          
+          # Reset
+          ACCUMULATED=""
+          CURRENT_TEXT=""
+          LAST_SEGMENT_COUNT=0
+          > "$OUTFILE"
+          
+          sleep 2
+          clear
+          echo "🎤 Continuous Mode"
+          echo ""
+          echo "Listening... (auto-copy)"
+          echo ""
+        fi
+      fi
+      LAST_TIME=$NOW
+    fi
+    
+    # Count segments to detect when a new one starts
+    SEGMENT_COUNT=$(grep -c "\[Start speaking\]" "$OUTFILE" 2>/dev/null | tr -d '\n')
+    [ -z "$SEGMENT_COUNT" ] && SEGMENT_COUNT=0
+    
+    # Extract latest text (longest/most complete line)
+    TEXT=$(cat "$OUTFILE" 2>/dev/null | \
+      sed 's/\x1b\[[0-9;]*[mKGH]//g' | \
+      sed 's/\r/\n/g' | \
+      sed -n '/\[Start speaking\]/,$p' | \
+      grep -v "whisper\|ggml\|init:\|main:\|Start speaking" | \
+      grep -viE '^\[.*\]$|^\(.*\)$|^[[:space:]]*$|BLANK_AUDIO|MUSIC' | \
+      sed 's/^ *//; s/ *$//' | \
+      awk '{if(length > max){max=length; line=$0}} END{print line}')
+    
+    # If new segment started, finalize previous text
+    if [ "$SEGMENT_COUNT" -gt "$LAST_SEGMENT_COUNT" ] && [ -n "$CURRENT_TEXT" ]; then
+      # Add current text to accumulated
+      if [ -n "$ACCUMULATED" ]; then
+        ACCUMULATED="$ACCUMULATED $CURRENT_TEXT"
+      else
+        ACCUMULATED="$CURRENT_TEXT"
+      fi
+      CURRENT_TEXT=""
+      LAST_SEGMENT_COUNT=$SEGMENT_COUNT
+      LAST_TIME=$NOW
+    fi
+    
+    # Update current segment text
+    if [ -n "$TEXT" ]; then
+      CURRENT_TEXT="$TEXT"
+      LAST_TIME=$NOW
+    fi
+    
+    # Display and copy
+    if [ -n "$ACCUMULATED" ] && [ -n "$CURRENT_TEXT" ]; then
+      DISPLAY="$ACCUMULATED $CURRENT_TEXT"
+    elif [ -n "$ACCUMULATED" ]; then
+      DISPLAY="$ACCUMULATED"
+    else
+      DISPLAY="$CURRENT_TEXT"
+    fi
+    
+    if [ -n "$DISPLAY" ]; then
+      printf "%s" "$DISPLAY" | pbcopy
+      
+      # Clear screen and redisplay to avoid wrapped line issues
+      clear
+      echo "🎤 Continuous Mode"
+      echo ""
+      echo "💬 $DISPLAY (📋)"
+    fi
+    
+    sleep 0.3
+  done
+  
+  rm -f "$OUTFILE"
+fi
