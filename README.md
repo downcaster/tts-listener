@@ -41,7 +41,7 @@ brew install --cask hammerspoon
 
 ```bash
 mkdir -p ~/.local/bin
-curl -L https://raw.githubusercontent.com/YOUR_USERNAME/listen-live/main/listen-live -o ~/.local/bin/listen-live
+curl -L https://raw.githubusercontent.com/downcaster/listen-live/main/listen-live -o ~/.local/bin/listen-live
 chmod +x ~/.local/bin/listen-live
 ```
 
