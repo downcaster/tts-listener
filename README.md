@@ -62,6 +62,7 @@ open -a Hammerspoon
 ```
 
 Grant Hammerspoon accessibility permissions when prompted (System Settings > Privacy & Security > Accessibility).
+Reload Hammerspoon config by clicking on the Hammerspoon top menu icon > "Reload Config"
 
 ## Usage
 
